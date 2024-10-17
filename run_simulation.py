@@ -29,7 +29,7 @@ NUM_CLIENTS = 10
 BATCH_SIZE = 64
 disable_progress_bar()
 with_poison = False
-directory = ""
+folder_path = ""
 
 class Net(nn.Module):
     """
@@ -57,9 +57,9 @@ class Net(nn.Module):
 class MetricsWriter:
   def __init__(self, filename: str):
     self.filename = filename
-    self.file_path = os.path.join(directory, self.filename)
+    self.file_path = os.path.join(folder_path, self.filename)
 
-    os.makedirs(directory, exist_ok=True)
+    os.makedirs(folder_path, exist_ok=True)
 
     if not os.path.exists(self.file_path):
       self.metrics = pd.DataFrame(columns=["client_id", "loss", "accuracy"])
@@ -361,7 +361,7 @@ def server_fn(context: Context) -> ServerAppComponents:
 
 def visualize_results(file_name):
     # Read the CSV file
-    file_path = os.path.join(directory, file_name)
+    file_path = os.path.join(folder_path, file_name)
 
     data = pd.read_csv(file_path)
 
@@ -425,16 +425,17 @@ def visualize_results(file_name):
 
 
 def main(arg):
+    global folder_path
     base_path = os.path.dirname(__file__)
 
     if arg == "p" or arg == "P":
         print("Running simulation with data poisoning on Client 0.")
         with_poison = True
-        directory = os.path.join(base_path, "results", "attack")
+        folder_path = os.path.join(base_path, "results", "attack")
     elif arg == "u" or arg == "U":
         print("Running simulation withOUT data poisoning.")
         with_poison = False
-        directory = os.path.join(base_path, "results", "no_attack")
+        folder_path = os.path.join(base_path, "results", "no_attack")
     else:
         print("Error: Invalid option. Please use 'p' or 'u' as the argument. ")
         sys.exit(1)       
