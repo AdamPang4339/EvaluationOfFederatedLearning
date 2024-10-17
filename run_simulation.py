@@ -419,9 +419,8 @@ def visualize_results(file_name):
     plt.savefig(os.path.splitext(file_path)[0])
     print(f"[+] Metrics saved to {file_path}.")
 
-
-
 def main(arg):
+    global with_poison
     global folder_path
     base_path = os.path.dirname(__file__)
 
