@@ -29,6 +29,7 @@ NUM_CLIENTS = 10
 BATCH_SIZE = 64
 disable_progress_bar()
 with_poison = False
+directory = ""
 
 class Net(nn.Module):
     """
@@ -56,13 +57,10 @@ class Net(nn.Module):
 class MetricsWriter:
   def __init__(self, filename: str):
     self.filename = filename
+    self.file_path = os.path.join(directory, self.filename)
 
-    if (with_poison):
-       os.makedirs("/results/attack", exist_ok=True)
-       self.file_path = os.path.join('/results/attack', self.filename)
-    else:
-       os.makedirs("/results/no_attack", exist_ok=True)
-       self.file_path = os.path.join('/results/no_attack', self.filename)
+    os.makedirs(directory, exist_ok=True)
+
     if not os.path.exists(self.file_path):
       self.metrics = pd.DataFrame(columns=["client_id", "loss", "accuracy"])
     else:
@@ -71,12 +69,12 @@ class MetricsWriter:
   def write_per_client(self, client_id: int, loss: float, accuracy: float, round: int):
     new_row = pd.DataFrame({"client_id": client_id, "loss": loss, "accuracy": accuracy, "round": round}, index=[0])
     self.metrics = pd.concat([self.metrics, new_row], ignore_index=True)
-    self.metrics.to_csv(self.filename, index=False)
+    self.metrics.to_csv(self.file_path, index=False)
 
   def write_aggregated(self, round: int, loss: float, accuracy: float):
     new_row = pd.DataFrame({"round": round, "agg_loss": loss, "agg_accuracy": accuracy}, index=[0])
     self.metrics = pd.concat([self.metrics, new_row], ignore_index=True)
-    self.metrics.to_csv(self.filename, index=False)
+    self.metrics.to_csv(self.file_path, index=False)
 
 class FlowerClient(NumPyClient):
     """ This is a class for a Federated Learning Client.
@@ -363,11 +361,7 @@ def server_fn(context: Context) -> ServerAppComponents:
 
 def visualize_results(file_name):
     # Read the CSV file
-    file_path = ""
-    if (with_poison):
-        file_path = os.path.join('/results/attack', file_name)
-    else:
-        file_path = os.path.join('/results/no_attack', file_name)
+    file_path = os.path.join(directory, file_name)
 
     data = pd.read_csv(file_path)
 
@@ -431,15 +425,19 @@ def visualize_results(file_name):
 
 
 def main(arg):
+    base_path = os.path.dirname(__file__)
+
     if arg == "p" or arg == "P":
         print("Running simulation with data poisoning on Client 0.")
         with_poison = True
+        directory = os.path.join(base_path, "results", "attack")
     elif arg == "u" or arg == "U":
         print("Running simulation withOUT data poisoning.")
         with_poison = False
+        directory = os.path.join(base_path, "results", "no_attack")
     else:
         print("Error: Invalid option. Please use 'p' or 'u' as the argument. ")
-        sys.exit(1)
+        sys.exit(1)       
 
     print("[+] Processing FEMNIST dataset...")
     if (with_poison):
@@ -451,8 +449,8 @@ def main(arg):
     net = Net().to(DEVICE)
 
     print("[+] Training global model...")
-    for epoch in range(5):
-        train(net, trainloader, 5)
+    for epoch in range(1):
+        train(net, trainloader, 1)
         loss, accuracy = test(net, valloader)
         print(f"Epoch {epoch+1}: validation loss {loss}, accuracy {accuracy}")
 
