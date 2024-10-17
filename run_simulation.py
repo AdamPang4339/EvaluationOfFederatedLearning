@@ -355,7 +355,7 @@ def server_fn(context: Context) -> ServerAppComponents:
   )
 
   # Configure the server for 5 rounds of training
-  config = ServerConfig(num_rounds=5)
+  config = ServerConfig(num_rounds=1)
 
   return ServerAppComponents(strategy=strategy, config=config)
 
@@ -416,10 +416,7 @@ def visualize_results(file_name):
     # Adjust layout
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 
-    if (with_poison):
-        plt.savefig(file_path)
-    else:
-        plt.savefig(file_path)
+    plt.savefig(folder_path)
     print(f"[+] Metrics saved to {file_path}.")
 
 
