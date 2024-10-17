@@ -355,7 +355,7 @@ def server_fn(context: Context) -> ServerAppComponents:
   )
 
   # Configure the server for 5 rounds of training
-  config = ServerConfig(num_rounds=1)
+  config = ServerConfig(num_rounds=5)
 
   return ServerAppComponents(strategy=strategy, config=config)
 
@@ -447,8 +447,8 @@ def main(arg):
     net = Net().to(DEVICE)
 
     print("[+] Training global model...")
-    for epoch in range(1):
-        train(net, trainloader, 1)
+    for epoch in range(5):
+        train(net, trainloader, 5)
         loss, accuracy = test(net, valloader)
         print(f"Epoch {epoch+1}: validation loss {loss}, accuracy {accuracy}")
 
