@@ -416,7 +416,7 @@ def visualize_results(file_name):
     # Adjust layout
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 
-    plt.savefig(folder_path)
+    plt.savefig(os.path.splitext(file_path)[0])
     print(f"[+] Metrics saved to {file_path}.")
 
 
