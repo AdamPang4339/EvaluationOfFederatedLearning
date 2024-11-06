@@ -16,11 +16,12 @@ from collections import OrderedDict
 import flwr
 from flwr.server.client_proxy import ClientProxy
 from flwr.client import Client, ClientApp, NumPyClient
-from flwr.common import Metrics, Context, EvaluateRes, FitRes, Scalar
+from flwr.common import Metrics, Context, EvaluateRes, FitRes, Scalar, parameters_to_ndarrays
 from flwr.server import ServerApp, ServerConfig, ServerAppComponents
 from flwr.server.strategy import FedAvg
 from flwr.simulation import run_simulation
 from flwr_datasets import FederatedDataset
+from flwr.common.typing import Parameters
 
 import argparse
 import sys
@@ -31,8 +32,7 @@ BATCH_SIZE = 64
 disable_progress_bar()
 with_poison = False
 folder_path = ""
-reputations = {}
-trusts = {}
+
 
 class Net(nn.Module):
     """
@@ -123,35 +123,34 @@ class FlowerClient(NumPyClient):
         return float(loss), len(self.valloader), {"client_id": self.partition_id, "accuracy": float(accuracy), "loss": float(loss)}
     
 class AggregateCustomMetricStrategy(FedAvg):
-    def aggregate_evaluate(
-        self,
-        server_round: int,
-        results: List[Tuple[ClientProxy, EvaluateRes]],
-        failures: List[Union[Tuple[ClientProxy, FitRes], BaseException]],
-    ) -> Tuple[Optional[float], Dict[str, Scalar]]:
-        """Aggregate evaluation accuracy using weighted average."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.trusts = {}
+        self.reputations = {}
 
         # This is a hyperparameter that controls the influence previous
         #   reputations have on the current one
         #   Write-up doesn't specify what to set this to so I chose 0.5
-        alpha = 0.5
+        self.alpha = 0.5
 
         # This is the trust threshold that a client must surpass to remain
         #   in the training pool
         #   write up does not specify so I chose 0.5
-        trust_threshold = 0.5
+        self.trust_threshold = 0.15
 
 
-        if not results:
-            return None, {}
+    def aggregate_fit(
+        self,
+        server_round: int,
+        results: List[Tuple[ClientProxy, FitRes]],
+        failures: List[Union[Tuple[ClientProxy, FitRes], BaseException]],
+    ) -> Tuple[List[np.ndarray], Dict[str, Scalar]]:
+        """Aggregate fit parameters and calculate L2 distance-based metrics."""
 
-        # Call aggregate_evaluate from base class (FedAvg) to aggregate loss and metrics
-        aggregated_loss, aggregated_metrics = super().aggregate_evaluate(
-            server_round, results, failures
-        )
+        aggregated_parameters, aggregated_metrics = super().aggregate_fit(server_round, results, failures)
 
-        # Get the aggregated parameters
-        aggregated_parameters = [param for _, param in aggregated_metrics.items()]
+        aggregated_parameters_ndarray = parameters_to_ndarrays(aggregated_parameters)
+        aggregated_parameters_flat = np.concatenate([arr.flatten() for arr in aggregated_parameters_ndarray])
 
         # Dictionary to store client normalized distances
         client_distances = {}
@@ -159,14 +158,15 @@ class AggregateCustomMetricStrategy(FedAvg):
         # runs through the clients and calculates the normalized L2 distance
         #   from the center of the major ML model's parameters' cluster to all
         #   the models
-        for client_proxy, evaluate_res in results:
-            client_parameters = evaluate_res.parameters
+        for client_proxy, fit_res in results:
+            client_parameters_ndarray = parameters_to_ndarrays(fit_res.parameters)
+            client_parameters_flat = np.concatenate([arr.flatten() for arr in client_parameters_ndarray])
 
             l2_distance = 0.0
-            for aggregated_param, client_param in zip(aggregated_parameters, client_parameters):
+            for aggregated_param, client_param in zip(aggregated_parameters_flat, client_parameters_flat):
                 l2_distance += np.sum((aggregated_param - client_param)**2)
 
-            num_params = len(aggregated_parameters)
+            num_params = len(aggregated_parameters_flat)
             normalized_l2_distance = np.sqrt(l2_distance) / num_params
 
             client_distances[client_proxy] = normalized_l2_distance
@@ -175,32 +175,33 @@ class AggregateCustomMetricStrategy(FedAvg):
         # if it's the first round, we don't have previous reputations
         #   so we start with 1 - distance
         if server_round == 1:
-            for client_proxy, distance in client_distances:
-                reputations[client_proxy] = 1 - distance
+            for client_proxy, distance in client_distances.items():
+                self.reputations[client_proxy] = 1 - distance
         
         # otherwise, we use the equations provided in the write up
         else:
             current_rep = 0
             # do the other thing
-            for client_proxy, distance in client_distances:
-                if distance < alpha:
-                    left_side = reputations[client_proxy] + distance
-                    right_side = reputations[client_proxy] / server_round
+            for client_proxy, distance in client_distances.items():
+                if distance < self.alpha:
+                    left_side = self.reputations[client_proxy] + distance
+                    right_side = self.reputations[client_proxy] / server_round
                     current_rep = left_side - right_side
 
-                    reputations[client_proxy] = current_rep
+                    self.reputations[client_proxy] = current_rep
                 else:
-                    left_side = reputations[client_proxy] + distance
-                    right_side = math.pow(math.e, -(1 - (distance*(reputations[client_proxy] / server_round))))
+                    left_side = self.reputations[client_proxy] + distance
+                    right_side = math.pow(math.e, -(1 - (distance*(self.reputations[client_proxy] / server_round))))
                     current_rep = left_side - right_side
 
-                    reputations[client_proxy] = current_rep
+                    self.reputations[client_proxy] = current_rep
 
         # set trusts
         # trusts are calculated using the equation provided in the write up
         #   and they are based uponm the current reputations and distances
-        for client_proxy, rep in reputations:
+        for client_proxy, rep in self.reputations.items():
             d = client_distances[client_proxy]
+            print(f"DISTANCE d: {d}   ###############################")
             first_root = math.sqrt(math.pow(rep, 2) + math.pow(d, 2))
             second_root = math.sqrt(math.pow(1 - rep, 2) + math.pow(1 - d, 2))
             trust = first_root - second_root
@@ -213,13 +214,46 @@ class AggregateCustomMetricStrategy(FedAvg):
             elif trust <= 0:
                 trust = 0
                 
-            trusts[client_proxy] = trust
+
+
+            print()
+            print()
+            print()
+            print("############################")
+            print(f"TRUST: {trust}")
+            print()
+            print()
+            print()
+
+
+            self.trusts[client_proxy] = trust
+
+        return aggregated_parameters, {"trusts": self.trusts}
+
+
+    def aggregate_evaluate(
+        self,
+        server_round: int,
+        results: List[Tuple[ClientProxy, EvaluateRes]],
+        failures: List[Union[Tuple[ClientProxy, FitRes], BaseException]],
+    ) -> Tuple[Optional[float], Dict[str, Scalar]]:
+        """Aggregate evaluation accuracy using weighted average."""
+
+        if not results:
+            return None, {}
+
+        # Call aggregate_evaluate from base class (FedAvg) to aggregate loss and metrics
+        aggregated_loss, aggregated_metrics = super().aggregate_evaluate(
+            server_round, results, failures
+        )
+
+
 
         # now we make a sperate dictionary to store only results
         #   that surpass the threshold
         filtered_results = {}
         for client_proxy, evaluate_res in results:
-            if trusts[client_proxy] >= trust_threshold:
+            if self.trusts[client_proxy] >= self.trust_threshold:
                 filtered_results[client_proxy] = evaluate_res
             
 
@@ -235,7 +269,7 @@ class AggregateCustomMetricStrategy(FedAvg):
         writer.write_aggregated(round=server_round, loss=aggregated_loss, accuracy=aggregated_accuracy)
 
         # For each of our client's results, write the client id, loss and accuracy to our metrics CSV file
-        for _, r in filtered_results:
+        for _, r in filtered_results.items():
             writer.write_per_client(client_id=r.metrics["client_id"], loss=r.metrics["loss"], accuracy=r.metrics["accuracy"], round=server_round)
 
 
