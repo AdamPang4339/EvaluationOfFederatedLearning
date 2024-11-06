@@ -9,6 +9,7 @@ import torch.nn.functional as F
 import torchvision.transforms as transforms
 from datasets.utils.logging import disable_progress_bar
 from torch.utils.data import DataLoader
+import math
 
 from collections import OrderedDict
 
@@ -30,6 +31,8 @@ BATCH_SIZE = 64
 disable_progress_bar()
 with_poison = False
 folder_path = ""
+reputations = {}
+trusts = {}
 
 class Net(nn.Module):
     """
@@ -55,26 +58,26 @@ class Net(nn.Module):
 
 # MetricsWriter class in charge of writing all metrics results to a CSV file
 class MetricsWriter:
-  def __init__(self, filename: str):
-    self.filename = filename
-    self.file_path = os.path.join(folder_path, self.filename)
+    def __init__(self, filename: str):
+        self.filename = filename
+        self.file_path = os.path.join(folder_path, self.filename)
 
-    os.makedirs(folder_path, exist_ok=True)
+        os.makedirs(folder_path, exist_ok=True)
 
-    if not os.path.exists(self.file_path):
-      self.metrics = pd.DataFrame(columns=["client_id", "loss", "accuracy"])
-    else:
-      self.metrics = pd.read_csv(self.file_path)
+        if not os.path.exists(self.file_path):
+            self.metrics = pd.DataFrame(columns=["client_id", "loss", "accuracy"])
+        else:
+            self.metrics = pd.read_csv(self.file_path)
 
-  def write_per_client(self, client_id: int, loss: float, accuracy: float, round: int):
-    new_row = pd.DataFrame({"client_id": client_id, "loss": loss, "accuracy": accuracy, "round": round}, index=[0])
-    self.metrics = pd.concat([self.metrics, new_row], ignore_index=True)
-    self.metrics.to_csv(self.file_path, index=False)
+    def write_per_client(self, client_id: int, loss: float, accuracy: float, round: int):
+        new_row = pd.DataFrame({"client_id": client_id, "loss": loss, "accuracy": accuracy, "round": round}, index=[0])
+        self.metrics = pd.concat([self.metrics, new_row], ignore_index=True)
+        self.metrics.to_csv(self.file_path, index=False)
 
-  def write_aggregated(self, round: int, loss: float, accuracy: float):
-    new_row = pd.DataFrame({"round": round, "agg_loss": loss, "agg_accuracy": accuracy}, index=[0])
-    self.metrics = pd.concat([self.metrics, new_row], ignore_index=True)
-    self.metrics.to_csv(self.file_path, index=False)
+    def write_aggregated(self, round: int, loss: float, accuracy: float):
+        new_row = pd.DataFrame({"round": round, "agg_loss": loss, "agg_accuracy": accuracy}, index=[0])
+        self.metrics = pd.concat([self.metrics, new_row], ignore_index=True)
+        self.metrics.to_csv(self.file_path, index=False)
 
 class FlowerClient(NumPyClient):
     """ This is a class for a Federated Learning Client.
@@ -84,40 +87,40 @@ class FlowerClient(NumPyClient):
     a single client.
     """
     def __init__(self, net, trainloader, valloader, partition_id):
-      self.net = net
-      self.trainloader = trainloader
-      self.valloader = valloader
-      self.partition_id = partition_id
+        self.net = net
+        self.trainloader = trainloader
+        self.valloader = valloader
+        self.partition_id = partition_id
 
     def get_parameters(self, config):
-      """ Get the parameters of the model """
-      return get_parameters(self.net)
+        """ Get the parameters of the model """
+        return get_parameters(self.net)
 
     def fit(self, parameters, config):
-      """ Get parameters from server, train model, return to server.
+        """ Get parameters from server, train model, return to server.
 
-      This method recieves the model parameters from the server and then
-      trains the model on the local data. After that, the updated model
-      parameters are returned to the server.
-      """
-      set_parameters(self.net, parameters)
-      train(self.net, self.trainloader, epochs=1)
-      return get_parameters(self.net), len(self.trainloader), {}
+        This method recieves the model parameters from the server and then
+        trains the model on the local data. After that, the updated model
+        parameters are returned to the server.
+        """
+        set_parameters(self.net, parameters)
+        train(self.net, self.trainloader, epochs=1)
+        return get_parameters(self.net), len(self.trainloader), {}
 
     def evaluate(self, parameters, config):
-      """ Get parameters from server, evaluate model, return to server.
+        """ Get parameters from server, evaluate model, return to server.
 
-      This method recieves the model parameters from the server and then
-      evaluates the model on the local data. After that, the evaluation
-      results are returned to the server.
-      """
-      set_parameters(self.net, parameters)
-      loss, accuracy = test(self.net, self.valloader)
+        This method recieves the model parameters from the server and then
+        evaluates the model on the local data. After that, the evaluation
+        results are returned to the server.
+        """
+        set_parameters(self.net, parameters)
+        loss, accuracy = test(self.net, self.valloader)
 
-      # writer = MetricsWriter(filename="metrics_per_client.csv")
-      # writer.write_per_client(client_id=self.partition_id, loss=loss, accuracy=accuracy)
+        # writer = MetricsWriter(filename="metrics_per_client.csv")
+        # writer.write_per_client(client_id=self.partition_id, loss=loss, accuracy=accuracy)
 
-      return float(loss), len(self.valloader), {"client_id": self.partition_id, "accuracy": float(accuracy), "loss": float(loss)}
+        return float(loss), len(self.valloader), {"client_id": self.partition_id, "accuracy": float(accuracy), "loss": float(loss)}
     
 class AggregateCustomMetricStrategy(FedAvg):
     def aggregate_evaluate(
@@ -128,6 +131,16 @@ class AggregateCustomMetricStrategy(FedAvg):
     ) -> Tuple[Optional[float], Dict[str, Scalar]]:
         """Aggregate evaluation accuracy using weighted average."""
 
+        # This is a hyperparameter that controls the influence previous
+        # reputations have on the current one
+        # Write-up doesn't specify what to set this to so I chose 0.5
+        alpha = 0.5
+
+        # This is the trust threshold that a client must surpass to remain
+        # in the training pool
+        trust_threshold = 0.5
+
+
         if not results:
             return None, {}
 
@@ -136,9 +149,69 @@ class AggregateCustomMetricStrategy(FedAvg):
             server_round, results, failures
         )
 
+        aggregated_parameters = [param for _, param in aggregated_metrics.items()]
+
+        client_distances = {}
+
+        for client_proxy, evaluate_res in results:
+            client_parameters = evaluate_res.parameters
+
+            l2_distance = 0.0
+            for aggregated_param, client_param in zip(aggregated_parameters, client_parameters):
+                l2_distance += np.sum((aggregated_param - client_param)**2)
+
+            num_params = len(aggregated_parameters)
+            normalized_l2_distance = np.sqrt(l2_distance) / num_params
+
+            client_distances[client_proxy] = normalized_l2_distance
+
+        # set reputations
+        if server_round == 1:
+            for client_proxy, distance in client_distances:
+                reputations[client_proxy] = distance
+                
+        else:
+            current_rep = 0
+            # do the other thing
+            for client_proxy, distance in client_distances:
+                if distance < alpha:
+                    left_side = reputations[client_proxy] + distance
+                    right_side = reputations[client_proxy] / server_round
+                    current_rep = left_side - right_side
+
+                    reputations[client_proxy] = current_rep
+                else:
+                    left_side = reputations[client_proxy] + distance
+                    right_side = math.pow(math.e, -(1 - (distance*(reputations[client_proxy] / server_round))))
+                    current_rep = left_side - right_side
+
+                    reputations[client_proxy] = current_rep
+
+        # set trusts
+        for client_proxy, rep in reputations:
+            d = client_distances[client_proxy]
+            first_root = math.sqrt(math.pow(rep, 2) + math.pow(d, 2))
+            second_root = math.sqrt(math.pow(1 - rep, 2) + math.pow(1 - d, 2))
+            trust = first_root - second_root
+
+            if trust >= 1:
+                trust = 1
+            elif trust <= 0:
+                trust = 0
+                
+            trusts[client_proxy] = trust
+
+        filtered_results = {}
+        for client_proxy, evaluate_res in results:
+            if trusts[client_proxy] >= trust_threshold:
+                filtered_results[client_proxy] = evaluate_res
+
+        filtered_length = len(filtered_results)
+            
+
         # Weigh accuracy of each client by number of examples used
-        accuracies = [r.metrics["accuracy"] * r.num_examples for _, r in results]
-        examples = [r.num_examples for _, r in results]
+        accuracies = [r.metrics["accuracy"] * r.num_examples for _, r in filtered_results]
+        examples = [r.num_examples for _, r in filtered_results]
 
         # Aggregate accuracy
         aggregated_accuracy = sum(accuracies) / sum(examples)
@@ -148,8 +221,8 @@ class AggregateCustomMetricStrategy(FedAvg):
         writer.write_aggregated(round=server_round, loss=aggregated_loss, accuracy=aggregated_accuracy)
 
         # For each of our client's results, write the client id, loss and accuracy to our metrics CSV file
-        for _, r in results:
-          writer.write_per_client(client_id=r.metrics["client_id"], loss=r.metrics["loss"], accuracy=r.metrics["accuracy"], round=server_round)
+        for _, r in filtered_results:
+            writer.write_per_client(client_id=r.metrics["client_id"], loss=r.metrics["loss"], accuracy=r.metrics["accuracy"], round=server_round)
 
 
         # Return aggregated loss and metrics (i.e., aggregated accuracy)
@@ -210,52 +283,52 @@ def load_unpoisoned_datasets(partition_id: int):
   return trainloader, valloader, testloader
 
 def load_poisoned_datasets(partition_id: int):
-  '''
-  Function loads different parts of the FEMNIST dataset depending on the partition
-  ID specified as a parameter. We have 10 clients in our simulation, so we will be using
-  10 partition IDs.
-  '''
-  # Split FEMNIST dataset into 10 partitions
-  fds = FederatedDataset(
-      dataset="flwrlabs/femnist",
-      partitioners={"train": NUM_CLIENTS}
-  )
-  partition = fds.load_partition(partition_id)
-
-  # Divide data in each partition: 80% train, 20% test
-  # Note: We use a set seed to make sure the results are reproducible
-  partition_train_test = partition.train_test_split(test_size=0.2, seed=21)
-
-  # Normalize and convert images to PyTorch tensors for more stable training
-  pytorch_transforms = transforms.Compose(
-      [transforms.ToTensor(), transforms.Normalize((0.5), (0.5))]
-  )
-
-  def apply_transforms(batch):
     '''
-    Applies transformations of pytorch_transforms on every image in place
+    Function loads different parts of the FEMNIST dataset depending on the partition
+    ID specified as a parameter. We have 10 clients in our simulation, so we will be using
+    10 partition IDs.
     '''
-    batch["image"] = [pytorch_transforms(img) for img in batch["image"]]
+    # Split FEMNIST dataset into 10 partitions
+    fds = FederatedDataset(
+        dataset="flwrlabs/femnist",
+        partitioners={"train": NUM_CLIENTS}
+    )
+    partition = fds.load_partition(partition_id)
 
-    if (partition_id == 0):
-      for i in range(len(batch["character"]) // 2):
-        batch["character"][i] = (batch["character"][i] + 1) % 62
+    # Divide data in each partition: 80% train, 20% test
+    # Note: We use a set seed to make sure the results are reproducible
+    partition_train_test = partition.train_test_split(test_size=0.2, seed=21)
 
-    return batch
+    # Normalize and convert images to PyTorch tensors for more stable training
+    pytorch_transforms = transforms.Compose(
+        [transforms.ToTensor(), transforms.Normalize((0.5), (0.5))]
+    )
+
+    def apply_transforms(batch):
+        '''
+        Applies transformations of pytorch_transforms on every image in place
+        '''
+        batch["image"] = [pytorch_transforms(img) for img in batch["image"]]
+
+        if (partition_id == 0):
+            for i in range(len(batch["character"]) // 2):
+                batch["character"][i] = (batch["character"][i] + 1) % 62
+
+        return batch
 
   # Create train/val for each partition and wrap it into DataLoader
-  partition_train_test = partition_train_test.with_transform(apply_transforms)
-  trainloader = DataLoader(
-      partition_train_test["train"], batch_size=BATCH_SIZE, shuffle=True
-  )
+    partition_train_test = partition_train_test.with_transform(apply_transforms)
+    trainloader = DataLoader(
+        partition_train_test["train"], batch_size=BATCH_SIZE, shuffle=True
+    )
 
-  # Generate DataLoaders for the validation and test data batches
-  # Generate testset as the whole dataset
-  valloader = DataLoader(partition_train_test["test"], batch_size=BATCH_SIZE)
-  testset = fds.load_split("train").with_transform(apply_transforms)
-  testloader = DataLoader(testset, batch_size=BATCH_SIZE)
+    # Generate DataLoaders for the validation and test data batches
+    # Generate testset as the whole dataset
+    valloader = DataLoader(partition_train_test["test"], batch_size=BATCH_SIZE)
+    testset = fds.load_split("train").with_transform(apply_transforms)
+    testloader = DataLoader(testset, batch_size=BATCH_SIZE)
 
-  return trainloader, valloader, testloader
+    return trainloader, valloader, testloader
 
 def train(net, trainloader, epochs: int, verbose=False):
     """Train the network on the training set."""
@@ -326,38 +399,38 @@ def client_fn(context: Context) -> Client:
     return FlowerClient(net, trainloader, valloader, partition_id).to_client()
 
 def weighted_average(metrics: List[Tuple[int, Metrics]]) -> Metrics:
-  # Multiply accuracy of each client by number of examples used
-  accuracies = [num_examples * m["accuracy"] for num_examples, m in metrics]
-  examples = [num_examples for num_examples, _ in metrics]
+    # Multiply accuracy of each client by number of examples used
+    accuracies = [num_examples * m["accuracy"] for num_examples, m in metrics]
+    examples = [num_examples for num_examples, _ in metrics]
 
-  # Aggregate and return custom metric (weighted average)
-  return {"accuracy": sum(accuracies) / sum(examples)}
+    # Aggregate and return custom metric (weighted average)
+    return {"accuracy": sum(accuracies) / sum(examples)}
 
 def server_fn(context: Context) -> ServerAppComponents:
-  """Construct components that set the ServerApp behaviour.
+    """Construct components that set the ServerApp behaviour.
 
-  Uses an instance of ServerConfig and the Federated Learning strategy
-  to create a ServerAppComponents object containing all of the settings
-  that define the behavior of the ServerApp.
-  """
+    Uses an instance of ServerConfig and the Federated Learning strategy
+    to create a ServerAppComponents object containing all of the settings
+    that define the behavior of the ServerApp.
+    """
 
-  # Create FedAvg strategy
-  # This is the Federated Learning strategy that details the approach
-  #   to the federated learning. This one uses the built-in
-  #   Federated Averaging (FedAvg) with some customizations.
+    # Create FedAvg strategy
+    # This is the Federated Learning strategy that details the approach
+    #   to the federated learning. This one uses the built-in
+    #   Federated Averaging (FedAvg) with some customizations.
 
-  strategy = AggregateCustomMetricStrategy(
-      fraction_fit=1.0,  # Sample 100% of available clients for training
-      fraction_evaluate=1.0,  # Sample 100% of available clients for evaluation
-      min_fit_clients=10,  # Never sample fewer than 10 clients for training
-      min_evaluate_clients=10,  # Never sample fewer than 10 clients for evaluation
-      min_available_clients=10,  # Wait until all 10 clients are available
-  )
+    strategy = AggregateCustomMetricStrategy(
+        fraction_fit=1.0,  # Sample 100% of available clients for training
+        fraction_evaluate=1.0,  # Sample 100% of available clients for evaluation
+        min_fit_clients=10,  # Never sample fewer than 10 clients for training
+        min_evaluate_clients=10,  # Never sample fewer than 10 clients for evaluation
+        min_available_clients=10,  # Wait until all 10 clients are available
+    )
 
-  # Configure the server for 5 rounds of training
-  config = ServerConfig(num_rounds=5)
+    # Configure the server for 5 rounds of training
+    config = ServerConfig(num_rounds=5)
 
-  return ServerAppComponents(strategy=strategy, config=config)
+    return ServerAppComponents(strategy=strategy, config=config)
 
 def visualize_results(file_name):
     # Read the CSV file
