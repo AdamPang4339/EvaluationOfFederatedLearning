@@ -132,12 +132,13 @@ class AggregateCustomMetricStrategy(FedAvg):
         """Aggregate evaluation accuracy using weighted average."""
 
         # This is a hyperparameter that controls the influence previous
-        # reputations have on the current one
-        # Write-up doesn't specify what to set this to so I chose 0.5
+        #   reputations have on the current one
+        #   Write-up doesn't specify what to set this to so I chose 0.5
         alpha = 0.5
 
         # This is the trust threshold that a client must surpass to remain
-        # in the training pool
+        #   in the training pool
+        #   write up does not specify so I chose 0.5
         trust_threshold = 0.5
 
 
@@ -149,10 +150,15 @@ class AggregateCustomMetricStrategy(FedAvg):
             server_round, results, failures
         )
 
+        # Get the aggregated parameters
         aggregated_parameters = [param for _, param in aggregated_metrics.items()]
 
+        # Dictionary to store client normalized distances
         client_distances = {}
 
+        # runs through the clients and calculates the normalized L2 distance
+        #   from the center of the major ML model's parameters' cluster to all
+        #   the models
         for client_proxy, evaluate_res in results:
             client_parameters = evaluate_res.parameters
 
@@ -166,10 +172,13 @@ class AggregateCustomMetricStrategy(FedAvg):
             client_distances[client_proxy] = normalized_l2_distance
 
         # set reputations
+        # if it's the first round, we don't have previous reputations
+        #   so we start with 1 - distance
         if server_round == 1:
             for client_proxy, distance in client_distances:
-                reputations[client_proxy] = distance
-                
+                reputations[client_proxy] = 1 - distance
+        
+        # otherwise, we use the equations provided in the write up
         else:
             current_rep = 0
             # do the other thing
@@ -188,12 +197,17 @@ class AggregateCustomMetricStrategy(FedAvg):
                     reputations[client_proxy] = current_rep
 
         # set trusts
+        # trusts are calculated using the equation provided in the write up
+        #   and they are based uponm the current reputations and distances
         for client_proxy, rep in reputations:
             d = client_distances[client_proxy]
             first_root = math.sqrt(math.pow(rep, 2) + math.pow(d, 2))
             second_root = math.sqrt(math.pow(1 - rep, 2) + math.pow(1 - d, 2))
             trust = first_root - second_root
 
+
+            # convert any trust values greater than 1 or less than 0
+            #   to 1 or 0 respectively
             if trust >= 1:
                 trust = 1
             elif trust <= 0:
@@ -201,12 +215,12 @@ class AggregateCustomMetricStrategy(FedAvg):
                 
             trusts[client_proxy] = trust
 
+        # now we make a sperate dictionary to store only results
+        #   that surpass the threshold
         filtered_results = {}
         for client_proxy, evaluate_res in results:
             if trusts[client_proxy] >= trust_threshold:
                 filtered_results[client_proxy] = evaluate_res
-
-        filtered_length = len(filtered_results)
             
 
         # Weigh accuracy of each client by number of examples used
@@ -229,58 +243,58 @@ class AggregateCustomMetricStrategy(FedAvg):
         return aggregated_loss, {"accuracy": aggregated_accuracy}
 
 def set_parameters(net, parameters: List[np.ndarray]):
-  """ Used to update the local model with parameters received from the server """
-  params_dict = zip(net.state_dict().keys(), parameters)
-  state_dict = OrderedDict({k: torch.Tensor(v) for k, v in params_dict})
-  net.load_state_dict(state_dict, strict=True)
+    """ Used to update the local model with parameters received from the server """
+    params_dict = zip(net.state_dict().keys(), parameters)
+    state_dict = OrderedDict({k: torch.Tensor(v) for k, v in params_dict})
+    net.load_state_dict(state_dict, strict=True)
 
 def get_parameters(net) -> List[np.ndarray]:
-  """ Used to get the parameters from the local model """
-  return [val.cpu().numpy() for _, val in net.state_dict().items()]
+    """ Used to get the parameters from the local model """
+    return [val.cpu().numpy() for _, val in net.state_dict().items()]
 
 def load_unpoisoned_datasets(partition_id: int):
-  '''
-  Function loads different parts of the FEMNIST dataset depending on the partition
-  ID specified as a parameter. We have 10 clients in our simulation, so we will be using
-  10 partition IDs.
-  '''
-  # Split FEMNIST dataset into 10 partitions
-  fds = FederatedDataset(
-      dataset="flwrlabs/femnist",
-      partitioners={"train": NUM_CLIENTS}
-  )
-  # femnist["train"].features["character"].int2str(value)
-  partition = fds.load_partition(partition_id)
-
-  # Divide data in each partition: 80% train, 20% test
-  # Note: We use a set seed to make sure the results are reproducible
-  partition_train_test = partition.train_test_split(test_size=0.2, seed=21)
-
-  # Normalize and convert images to PyTorch tensors for more stable training
-  pytorch_transforms = transforms.Compose(
-      [transforms.ToTensor(), transforms.Normalize((0.5), (0.5))]
-  )
-
-  def apply_transforms(batch):
     '''
-    Applies transformations of pytorch_transforms on every image in place
+    Function loads different parts of the FEMNIST dataset depending on the partition
+    ID specified as a parameter. We have 10 clients in our simulation, so we will be using
+    10 partition IDs.
     '''
-    batch["image"] = [pytorch_transforms(img) for img in batch["image"]]
-    return batch
+    # Split FEMNIST dataset into 10 partitions
+    fds = FederatedDataset(
+        dataset="flwrlabs/femnist",
+        partitioners={"train": NUM_CLIENTS}
+    )
+    # femnist["train"].features["character"].int2str(value)
+    partition = fds.load_partition(partition_id)
 
-  # Create train/val for each partition and wrap it into DataLoader
-  partition_train_test = partition_train_test.with_transform(apply_transforms)
-  trainloader = DataLoader(
-      partition_train_test["train"], batch_size=BATCH_SIZE, shuffle=True
+    # Divide data in each partition: 80% train, 20% test
+    # Note: We use a set seed to make sure the results are reproducible
+    partition_train_test = partition.train_test_split(test_size=0.2, seed=21)
+
+    # Normalize and convert images to PyTorch tensors for more stable training
+    pytorch_transforms = transforms.Compose(
+        [transforms.ToTensor(), transforms.Normalize((0.5), (0.5))]
+    )
+
+    def apply_transforms(batch):
+        '''
+        Applies transformations of pytorch_transforms on every image in place
+        '''
+        batch["image"] = [pytorch_transforms(img) for img in batch["image"]]
+        return batch
+
+    # Create train/val for each partition and wrap it into DataLoader
+    partition_train_test = partition_train_test.with_transform(apply_transforms)
+    trainloader = DataLoader(
+        partition_train_test["train"], batch_size=BATCH_SIZE, shuffle=True
   )
 
-  # Generate DataLoaders for the validation and test data batches
-  # Generate testset as the whole dataset
-  valloader = DataLoader(partition_train_test["test"], batch_size=BATCH_SIZE)
-  testset = fds.load_split("train").with_transform(apply_transforms)
-  testloader = DataLoader(testset, batch_size=BATCH_SIZE)
+    # Generate DataLoaders for the validation and test data batches
+    # Generate testset as the whole dataset
+    valloader = DataLoader(partition_train_test["test"], batch_size=BATCH_SIZE)
+    testset = fds.load_split("train").with_transform(apply_transforms)
+    testloader = DataLoader(testset, batch_size=BATCH_SIZE)
 
-  return trainloader, valloader, testloader
+    return trainloader, valloader, testloader
 
 def load_poisoned_datasets(partition_id: int):
     '''
