@@ -135,7 +135,6 @@ class AggregateCustomMetricStrategy(FedAvg):
 
         # This is the trust threshold that a client must surpass to remain
         #   in the training pool
-        #   write up does not specify so I chose 0.5
         self.trust_threshold = 0.15
 
 
@@ -166,10 +165,37 @@ class AggregateCustomMetricStrategy(FedAvg):
             for aggregated_param, client_param in zip(aggregated_parameters_flat, client_parameters_flat):
                 l2_distance += np.sum((aggregated_param - client_param)**2)
 
-            num_params = len(aggregated_parameters_flat)
-            normalized_l2_distance = np.sqrt(l2_distance) / num_params
+            normalized_l2_distance = np.log(1 + np.sqrt(l2_distance))
 
             client_distances[client_proxy] = normalized_l2_distance
+        
+        # # Calculate the mean, max, and min of the distances
+        # mean_distance = np.mean(list(client_distances.values()))
+        # max_distance = np.max(list(client_distances.values()))
+        # min_distance = np.min(list(client_distances.values()))
+
+        # # Normalize the distances to be between 0 and 1
+        # for client_proxy, distance in client_distances.items():
+        #     print(f"UNNORMALIZED DISTANCE: {distance}")
+        #     normalized_distance = (distance - mean_distance) / (max_distance - min_distance)
+        #     normalized_distance = np.clip(normalized_distance, 0, 1)  # Ensure it stays within 0 and 1
+        #     client_distances[client_proxy] = normalized_distance
+
+        # Calculate mean and standard deviation for Z-score normalization
+        mean_distance = np.mean(list(client_distances.values()))
+        std_distance = np.std(list(client_distances.values()))
+
+        # Apply Z-score normalization
+        z_scores = {client: (distance - mean_distance) / std_distance for client, distance in client_distances.items()}
+
+        # Find min and max Z-scores to rescale to [0, 1]
+        z_min = min(z_scores.values())
+        z_max = max(z_scores.values())
+
+        # Rescale Z-scores to [0, 1]
+        for client_proxy, z_score in z_scores.items():
+            rescaled_distance = (z_score - z_min) / (z_max - z_min)
+            client_distances[client_proxy] = np.clip(rescaled_distance, 0, 1)
 
         # set reputations
         # if it's the first round, we don't have previous reputations
@@ -177,6 +203,7 @@ class AggregateCustomMetricStrategy(FedAvg):
         if server_round == 1:
             for client_proxy, distance in client_distances.items():
                 self.reputations[client_proxy] = 1 - distance
+                # self.reputations[client_proxy] = 0
         
         # otherwise, we use the equations provided in the write up
         else:
@@ -186,43 +213,37 @@ class AggregateCustomMetricStrategy(FedAvg):
                 if distance < self.alpha:
                     left_side = self.reputations[client_proxy] + distance
                     right_side = self.reputations[client_proxy] / server_round
-                    current_rep = left_side - right_side
+                    current_rep = 1 - (left_side - right_side)
 
-                    self.reputations[client_proxy] = current_rep
+                    self.reputations[client_proxy] = max(0, min(1, current_rep))
                 else:
                     left_side = self.reputations[client_proxy] + distance
                     right_side = math.pow(math.e, -(1 - (distance*(self.reputations[client_proxy] / server_round))))
-                    current_rep = left_side - right_side
+                    current_rep = 1 - (left_side - right_side)
 
-                    self.reputations[client_proxy] = current_rep
+                    self.reputations[client_proxy] = max(0, min(1, current_rep))
+
 
         # set trusts
         # trusts are calculated using the equation provided in the write up
         #   and they are based uponm the current reputations and distances
         for client_proxy, rep in self.reputations.items():
             d = client_distances[client_proxy]
-            print(f"DISTANCE d: {d}   ###############################")
+            print("############################")
+            print(f"Client: {client_proxy}")
+            print(f"DISTANCE d: {d:.8f}   \t REP r: {rep}   ###############################")
             first_root = math.sqrt(math.pow(rep, 2) + math.pow(d, 2))
-            second_root = math.sqrt(math.pow(1 - rep, 2) + math.pow(1 - d, 2))
-            trust = first_root - second_root
-
-
+            second_root = math.sqrt(math.pow(1 - rep, 2) + math.pow((1 - d), 2))
+            trust = (first_root - second_root)
+            print(f"PRE-CLAMP TRUST: {trust:.10f}")
             # convert any trust values greater than 1 or less than 0
             #   to 1 or 0 respectively
-            if trust >= 1:
-                trust = 1
-            elif trust <= 0:
-                trust = 0
-                
-
-
-            print()
-            print()
-            print()
-            print("############################")
-            print(f"TRUST: {trust}")
-            print()
-            print()
+            epsilon = 1e-8  # A very small value to prevent trust from being 0
+            trust = (1 - max(0, min(1, trust))) * ((1 - d) + epsilon)
+            # Reclamp in the case of epsilon bringing trust beyond 1
+            trust = max(0, min(1, trust))
+            
+            print(f"TRUST: {trust:.10f}")
             print()
 
 
@@ -247,21 +268,19 @@ class AggregateCustomMetricStrategy(FedAvg):
             server_round, results, failures
         )
 
-
-
         # now we make a sperate dictionary to store only results
         #   that surpass the threshold
         filtered_results = {}
         for client_proxy, evaluate_res in results:
             if self.trusts[client_proxy] >= self.trust_threshold:
                 filtered_results[client_proxy] = evaluate_res
-            
 
         # Weigh accuracy of each client by number of examples used
-        accuracies = [r.metrics["accuracy"] * r.num_examples for _, r in filtered_results]
-        examples = [r.num_examples for _, r in filtered_results]
+        accuracies = [r.metrics["accuracy"] * r.num_examples for r in filtered_results.values()]
+        examples = [r.num_examples for r in filtered_results.values()]
 
         # Aggregate accuracy
+        print(examples)
         aggregated_accuracy = sum(accuracies) / sum(examples)
 
         # Write aggregated accuracy to our metrics CSV file
@@ -567,8 +586,8 @@ def main(arg):
     net = Net().to(DEVICE)
 
     print("[+] Training global model...")
-    for epoch in range(5):
-        train(net, trainloader, 5)
+    for epoch in range(3):
+        train(net, trainloader, 2)
         loss, accuracy = test(net, valloader)
         print(f"Epoch {epoch+1}: validation loss {loss}, accuracy {accuracy}")
 
