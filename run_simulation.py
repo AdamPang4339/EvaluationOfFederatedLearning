@@ -69,8 +69,10 @@ class MetricsWriter:
         else:
             self.metrics = pd.read_csv(self.file_path)
 
-    def write_per_client(self, client_id: int, loss: float, accuracy: float, round: int):
-        new_row = pd.DataFrame({"client_id": client_id, "loss": loss, "accuracy": accuracy, "round": round}, index=[0])
+    def write_per_client(self, client_id: int, loss: float, accuracy: float, trust: float, 
+                         reputation: float, round: int):
+        new_row = pd.DataFrame({"client_id": client_id, "loss": loss, "accuracy": accuracy, 
+                                "trust": trust, "reputation": reputation, "round": round}, index=[0])
         self.metrics = pd.concat([self.metrics, new_row], ignore_index=True)
         self.metrics.to_csv(self.file_path, index=False)
 
@@ -105,7 +107,7 @@ class FlowerClient(NumPyClient):
         """
         set_parameters(self.net, parameters)
         train(self.net, self.trainloader, epochs=1)
-        return get_parameters(self.net), len(self.trainloader), {}
+        return get_parameters(self.net), len(self.trainloader), {"client_id": self.partition_id}
 
     def evaluate(self, parameters, config):
         """ Get parameters from server, evaluate model, return to server.
@@ -157,7 +159,7 @@ class AggregateCustomMetricStrategy(FedAvg):
         # runs through the clients and calculates the normalized L2 distance
         #   from the center of the major ML model's parameters' cluster to all
         #   the models
-        for client_proxy, fit_res in results:
+        for _, fit_res in results:
             client_parameters_ndarray = parameters_to_ndarrays(fit_res.parameters)
             client_parameters_flat = np.concatenate([arr.flatten() for arr in client_parameters_ndarray])
 
@@ -167,7 +169,7 @@ class AggregateCustomMetricStrategy(FedAvg):
 
             normalized_l2_distance = np.log(1 + np.sqrt(l2_distance))
 
-            client_distances[client_proxy] = normalized_l2_distance
+            client_distances[fit_res.metrics["client_id"]] = normalized_l2_distance
         
         # # Calculate the mean, max, and min of the distances
         # mean_distance = np.mean(list(client_distances.values()))
@@ -186,51 +188,51 @@ class AggregateCustomMetricStrategy(FedAvg):
         std_distance = np.std(list(client_distances.values()))
 
         # Apply Z-score normalization
-        z_scores = {client: (distance - mean_distance) / std_distance for client, distance in client_distances.items()}
+        z_scores = {client_id: (distance - mean_distance) / std_distance for client_id, distance in client_distances.items()}
 
         # Find min and max Z-scores to rescale to [0, 1]
         z_min = min(z_scores.values())
         z_max = max(z_scores.values())
 
         # Rescale Z-scores to [0, 1]
-        for client_proxy, z_score in z_scores.items():
+        for client_id, z_score in z_scores.items():
             rescaled_distance = (z_score - z_min) / (z_max - z_min)
-            client_distances[client_proxy] = np.clip(rescaled_distance, 0, 1)
+            client_distances[client_id] = np.clip(rescaled_distance, 0, 1)
 
         # set reputations
         # if it's the first round, we don't have previous reputations
         #   so we start with 1 - distance
         if server_round == 1:
-            for client_proxy, distance in client_distances.items():
-                self.reputations[client_proxy] = 1 - distance
+            for client_id, distance in client_distances.items():
+                self.reputations[client_id] = 1 - distance
                 # self.reputations[client_proxy] = 0
         
         # otherwise, we use the equations provided in the write up
         else:
             current_rep = 0
             # do the other thing
-            for client_proxy, distance in client_distances.items():
+            for client_id, distance in client_distances.items():
                 if distance < self.alpha:
-                    left_side = self.reputations[client_proxy] + distance
-                    right_side = self.reputations[client_proxy] / server_round
+                    left_side = self.reputations[client_id] + distance
+                    right_side = self.reputations[client_id] / server_round
                     current_rep = 1 - (left_side - right_side)
 
-                    self.reputations[client_proxy] = max(0, min(1, current_rep))
+                    self.reputations[client_id] = max(0, min(1, current_rep))
                 else:
-                    left_side = self.reputations[client_proxy] + distance
-                    right_side = math.pow(math.e, -(1 - (distance*(self.reputations[client_proxy] / server_round))))
+                    left_side = self.reputations[client_id] + distance
+                    right_side = math.pow(math.e, -(1 - (distance*(self.reputations[client_id] / server_round))))
                     current_rep = 1 - (left_side - right_side)
 
-                    self.reputations[client_proxy] = max(0, min(1, current_rep))
+                    self.reputations[client_id] = max(0, min(1, current_rep))
 
 
         # set trusts
         # trusts are calculated using the equation provided in the write up
         #   and they are based uponm the current reputations and distances
-        for client_proxy, rep in self.reputations.items():
-            d = client_distances[client_proxy]
+        for client_id, rep in self.reputations.items():
+            d = client_distances[client_id]
             print("############################")
-            print(f"Client: {client_proxy}")
+            print(f"Client: {client_id}")
             print(f"DISTANCE d: {d:.8f}   \t REP r: {rep}   ###############################")
             first_root = math.sqrt(math.pow(rep, 2) + math.pow(d, 2))
             second_root = math.sqrt(math.pow(1 - rep, 2) + math.pow((1 - d), 2))
@@ -247,7 +249,7 @@ class AggregateCustomMetricStrategy(FedAvg):
             print()
 
 
-            self.trusts[client_proxy] = trust
+            self.trusts[client_id] = trust
 
         return aggregated_parameters, {"trusts": self.trusts}
 
@@ -271,9 +273,9 @@ class AggregateCustomMetricStrategy(FedAvg):
         # now we make a sperate dictionary to store only results
         #   that surpass the threshold
         filtered_results = {}
-        for client_proxy, evaluate_res in results:
-            if self.trusts[client_proxy] >= self.trust_threshold:
-                filtered_results[client_proxy] = evaluate_res
+        for _, evaluate_res in results:
+            if self.trusts[evaluate_res.metrics["client_id"]] >= self.trust_threshold:
+                filtered_results[evaluate_res.metrics["client_id"]] = evaluate_res
 
         # Weigh accuracy of each client by number of examples used
         accuracies = [r.metrics["accuracy"] * r.num_examples for r in filtered_results.values()]
@@ -287,9 +289,11 @@ class AggregateCustomMetricStrategy(FedAvg):
         writer = MetricsWriter(filename="metrics.csv")
         writer.write_aggregated(round=server_round, loss=aggregated_loss, accuracy=aggregated_accuracy)
 
-        # For each of our client's results, write the client id, loss and accuracy to our metrics CSV file
-        for _, r in filtered_results.items():
-            writer.write_per_client(client_id=r.metrics["client_id"], loss=r.metrics["loss"], accuracy=r.metrics["accuracy"], round=server_round)
+        # For each of our client's results, write the client id, trust, reputation, loss and accuracy to our metrics CSV file
+        for _, r in results:
+            writer.write_per_client(client_id=r.metrics["client_id"], loss=r.metrics["loss"], 
+                                    accuracy=r.metrics["accuracy"], trust=self.trusts[r.metrics["client_id"]], 
+                                    reputation=self.reputations[r.metrics["client_id"]], round=server_round)
 
 
         # Return aggregated loss and metrics (i.e., aggregated accuracy)
@@ -512,7 +516,7 @@ def visualize_results(file_name):
     client_data = data.dropna(subset=['client_id'])
 
     # Create a figure with subplots
-    fig, axis = plt.subplots(2, 2, figsize=(12, 10))
+    fig, axis = plt.subplots(3, 2, figsize=(12, 10))
     fig.suptitle('Federated Learning Metrics', fontsize=16)
 
     # 1. History of loss per client over rounds
@@ -552,6 +556,28 @@ def visualize_results(file_name):
     axis[1, 1].set_xlabel('Rounds')
     axis[1, 1].set_ylabel('Average Accuracy')
     axis[1, 1].grid()
+
+    # 5. History of trust per client over rounds
+    for client_id in client_data['client_id'].unique():
+        client_df = client_data[client_data['client_id'] == client_id]
+        axis[2, 0].plot(client_df['round'], client_df['trust'], marker='o', label=f'Client {client_id}')
+
+    axis[2, 0].set_title('Trust per Client Over Rounds')
+    axis[2, 0].set_xlabel('Rounds')
+    axis[2, 0].set_ylabel('Accuracy')
+    axis[2, 0].legend()
+    axis[2, 0].grid()
+
+    # 6. History of reputation per client over rounds
+    for client_id in client_data['client_id'].unique():
+        client_df = client_data[client_data['client_id'] == client_id]
+        axis[2, 1].plot(client_df['round'], client_df['reputation'], marker='o', label=f'Client {client_id}')
+
+    axis[2, 1].set_title('Reputation per Client Over Rounds')
+    axis[2, 1].set_xlabel('Rounds')
+    axis[2, 1].set_ylabel('Accuracy')
+    axis[2, 1].legend()
+    axis[2, 1].grid()
 
     # Adjust layout
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
